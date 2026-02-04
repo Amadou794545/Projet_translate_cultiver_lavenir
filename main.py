@@ -2,51 +2,160 @@ import streamlit as st
 import whisper
 from whisper.utils import get_writer
 import os
+import tempfile
+import shutil
 
-st.set_page_config(page_title="Cultiver l'Avenir", page_icon="🌍")
+from transformers import MarianMTModel, MarianTokenizer
 
-st.title("🌍 Traduction Automatique des Portraits")
+# -----------------------------
+# CONFIG STREAMLIT
+# -----------------------------
+st.set_page_config(
+    page_title="Cultiver l'Avenir - Sous-titrage",
+    page_icon="🌍"
+)
 
+st.title("🌍 Plateforme de Transcription & Traduction")
+st.markdown("🎧 Vidéo italien → 🇫🇷 Sous-titres français + Texte brut")
 
-# Utilisation du modèle 'base' pour éviter que Streamlit Cloud ne plante (limite RAM)
+# -----------------------------
+# CHECK FFMPEG
+# -----------------------------
+if shutil.which("ffmpeg") is None:
+    st.error("❌ FFmpeg n'est pas installé.")
+    st.warning("Installe-le avec : winget install ffmpeg")
+    st.stop()
+
+# -----------------------------
+# LOAD WHISPER
+# -----------------------------
 @st.cache_resource
-def load_model():
+def load_whisper():
     return whisper.load_model("base")
 
+# -----------------------------
+# LOAD TRANSLATOR (MarianMT)
+# -----------------------------
+@st.cache_resource
+def load_translator():
+    model_name = "Helsinki-NLP/opus-mt-it-fr"
+    tokenizer = MarianTokenizer.from_pretrained(model_name)
+    model = MarianMTModel.from_pretrained(model_name)
+    return tokenizer, model
 
-try:
-    model = load_model()
-    st.success("IA prête à l'emploi !")
-except Exception as e:
-    st.error(f"Erreur lors du chargement de l'IA : {e}")
+whisper_model = load_whisper()
+tokenizer, translator_model = load_translator()
 
-uploaded_file = st.file_uploader("Importer la vidéo italienne", type=["mp4", "mov", "mp3"])
+# -----------------------------
+# TRANSLATE FUNCTION (chunk safe)
+# -----------------------------
+def translate_it_to_fr(text):
+    """
+    Traduction en français phrase par phrase
+    (évite les limites de longueur)
+    """
+    sentences = text.split(".")
+    french_sentences = []
 
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if sentence == "":
+            continue
+
+        inputs = tokenizer(sentence, return_tensors="pt", truncation=True)
+        translated_tokens = translator_model.generate(**inputs)
+        fr = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+
+        french_sentences.append(fr)
+
+    return ". ".join(french_sentences)
+
+
+# -----------------------------
+# UPLOAD FILE
+# -----------------------------
+uploaded_file = st.file_uploader(
+    "📂 Importer une vidéo/audio italien",
+    type=["mp4", "mkv", "mov", "mp3", "wav"]
+)
+
+# -----------------------------
+# PROCESS
+# -----------------------------
 if uploaded_file is not None:
-    with open("temp_video.mp4", "wb") as f:
-        f.write(uploaded_file.getbuffer())
 
-    st.info("Transcription et Traduction en cours... Patientez quelques minutes.")
+    # Sauvegarde temporaire
+    file_extension = os.path.splitext(uploaded_file.name)[1]
 
-    try:
-        # On demande à Whisper de traduire directement en français (task='translate')
-        # Whisper traduit nativement vers l'anglais, pour le français il faut parfois
-        # une étape de plus, mais testons la version directe :
-        result = model.transcribe("temp_video.mp4", task="translate")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+        temp_file.write(uploaded_file.getbuffer())
+        temp_path = temp_file.name
 
-        # Création des fichiers SRT et TXT
-        output_dir = "."
-        writer = get_writer("srt", output_dir)
-        writer(result, "subtitles.srt")
+    # Barre de progression
+    progress = st.progress(0)
+    status = st.empty()
 
-        st.success("Analyse terminée !")
+    # -----------------------------
+    # 1. TRANSCRIPTION ITALIEN
+    # -----------------------------
+    status.info("🎧 Transcription italienne en cours...")
+    progress.progress(20)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            with open("subtitles.srt", "rb") as f:
-                st.download_button("Télécharger le .SRT", f, file_name="traduction.srt")
-        with col2:
-            st.download_button("Télécharger le .TXT", result["text"], file_name="transcription.txt")
+    result = whisper_model.transcribe(temp_path, task="transcribe")
 
-    except Exception as e:
-        st.error(f"Une erreur est survenue pendant le traitement : {e}")
+    italian_text = result["text"].strip()
+    progress.progress(55)
+
+    # -----------------------------
+    # 2. TRADUCTION FRANÇAIS
+    # -----------------------------
+    status.info("🌍 Traduction italien → français en cours...")
+    french_text = translate_it_to_fr(italian_text)
+
+    progress.progress(85)
+
+    # -----------------------------
+    # 3. GÉNÉRATION SRT FR
+    # -----------------------------
+    status.info("📝 Génération des sous-titres français...")
+
+    output_dir = "."
+    srt_writer = get_writer("srt", output_dir)
+
+    # Remplacer le texte par la traduction française
+    result["text"] = french_text
+    srt_writer(result, "subtitles_fr")
+
+    progress.progress(100)
+    status.success("✅ Terminé !")
+
+    # -----------------------------
+    # DOWNLOAD BUTTONS
+    # -----------------------------
+    col1, col2 = st.columns(2)
+
+    with col1:
+        with open("subtitles_fr.srt", "rb") as f:
+            st.download_button(
+                "📥 Télécharger SRT (FR)",
+                f,
+                file_name="sous_titres_fr.srt"
+            )
+
+    with col2:
+        st.download_button(
+            "📥 Télécharger TXT (FR)",
+            french_text,
+            file_name="transcription_fr.txt"
+        )
+
+    # -----------------------------
+    # PREVIEW
+    # -----------------------------
+    with st.expander("👀 Voir le texte traduit en français"):
+        st.write(french_text)
+
+    # -----------------------------
+    # CLEAN TEMP FILE
+    # -----------------------------
+    os.remove(temp_path)
